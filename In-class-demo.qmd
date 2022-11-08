@@ -1,0 +1,178 @@
+---
+title: "in class work"
+format: html
+editor: visual
+jupyter: python3
+---
+
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+library(jsonlite)
+library(here)
+library(rnaturalearth)
+```
+
+`rnaturalearth` contains map polygons which are good for visualization
+
+## IUCN Red List API
+
+Using the API: generate authorization token, and create a URL to link to the data. In this example we'll just use the example IUCN token. Don't usually want to include your access token in your code - instead store your token somewhere else. with `R` we can edit our r environment with usethis.
+
+`usethis::edit_r_environ()`
+
+```{r}
+iucn_token <- Sys.getenv('IUCN_KEY')
+
+iucn_url <- "https://apiv3.iucnredlist.org"
+spp_page_endpoint <- paste0(iucn_url, "/api/v3/species/page/%s?token=%s")
+spp_page_url <- sprintf(spp_page_endpoint, 2, iucn_token) #plugs in token for second %s symbol in string spp_page_endpoint
+
+spp_page <- jsonlite::fromJSON(spp_page_url)
+
+#use string print formant (sprintf) to substitute page numbers and api tokens
+
+#see that spp_page is now 10000 results on a page
+#can pull out a df from this result element
+spp_page_df <- spp_page$result
+
+```
+
+Now access a specific species, humpback whale, using the `taxonid` in the df - 13006
+
+```{r}
+spp_country_endpoint <- paste0(iucn_url, '/api/v3/species/countries/id/%s?token=%s')
+spp_country_url <- sprintf(spp_country_endpoint, 13006, iucn_token)
+spp_country <- jsonlite::fromJSON(spp_country_url)
+
+spp_country_df <- spp_country$result
+```
+
+## Spatial Data
+
+Read in some cleaned IUCN data from Casey - contains marine mammal species. Combine IUCN species concern data with spatial data
+
+```{r}
+
+#read in iucn data
+iucn_spp_df <- read_csv(here('data/iucn_mar_mammal_info_v2021-3.csv'))
+
+#read in cleaned aquamaps data, clean 
+am_spp_df <- read_csv(here('data/am_mammal_info_v10_2019.csv')) |> 
+  janitor::clean_names() |> 
+  rename(am_sid = species_id, iucn_sid = iucn_id)
+
+```
+
+Now read in aquamaps species cell info
+
+```{r}
+am_spp_cells_df <- read_csv(here('data/am_mammal_hcaf_cropped_v10_2019.csv'))
+```
+
+Now read in cleaned HCAF (half-degree cleaned authority file) data
+
+```{r}
+am_hcaf_df <- read_csv(here('data/am_hcaf_cropped_v7.csv')) |> 
+  janitor::clean_names()
+```
+
+```{r}
+#filter down df to just have location info for ocean cells
+longlat_id_df <- am_hcaf_df |> 
+  filter(ocean_area > 0) |> 
+  select(center_long, center_lat, loiczid)
+
+
+hcaf_r <-rast(longlat_id_df, type = 'xyz', crs = 'epsg:4326')
+
+plot(hcaf_r)
+```
+
+Start joining things!
+
+```{r}
+
+#use speciesid number from iucn and match name and risk level with the aquamaps info about spatial info
+
+#start with iucn species df
+id_risk_df <- iucn_spp_df |> 
+  select(iucn_sid, sciname, category) |> 
+  mutate(cat_score = case_when(category == 'LC' ~ 0,
+                               category == 'NT' ~ 1,
+                               category == 'VU' ~ 2,
+                               category == 'EN' ~ 3,
+                               category == 'CR' ~ 4,
+                               category == 'EX' ~ 5,
+                               TRUE ~ NA_real_
+                               )) |> 
+  left_join(am_spp_df, by = 'iucn_sid') |> 
+  select(iucn_sid, am_sid, sciname, f_bname, category, cat_score) |> 
+  filter(!is.na(am_sid))
+
+#now join again
+
+risk_cells_df <- id_risk_df |> 
+  left_join(am_spp_cells_df, by = 'am_sid')
+
+```
+
+Now map orca suitability - select species
+
+```{r}
+orca_df <- risk_cells_df |> 
+  filter(sciname == 'Orcinus orca')
+
+#substitute
+orca_prob_r <- terra::subst(hcaf_r,
+                            from = orca_df$loiczid,
+                            to = orca_df$prob)
+                            #others = NA)
+#need to update terra to use others argument
+                 
+#instead, coerece probabilities greater than 1 (the nas with loiczid value) to be NA           
+orca_prob_r[orca_prob_r > 1] <- NA
+plot(orca_prob_r, main = "Probability of occurance for Orcinus orca")
+```
+
+Now lets look at species richness
+
+```{r}
+spp_rich_df <- risk_cells_df |> 
+  filter(prob >= .5) |> 
+  group_by(loiczid) |> 
+  summarise(n_spp = n_distinct(am_sid))
+
+spp_rich_r <- terra::subst(hcaf_r,
+                           from = spp_rich_df$loiczid,
+                           to = spp_rich_df$n_spp)
+
+#coerce values again
+spp_rich_r[spp_rich_r > 117] <- NA
+
+plot(spp_rich_r, main = "mammal species richness")
+
+```
+
+Analyze extinction risk and map!
+
+```{r}
+
+#create a table to show how many species are in each category
+table(id_risk_df$category)
+
+#of species in each cell, whats the probability of their extinction risk?
+mean_risk_df <- risk_cells_df |> 
+  filter(prob >= 0.5) |> 
+  group_by(loiczid) |> 
+  summarise(mean_risk = mean(cat_score, na.rm = TRUE))
+
+mean_risk_r <- subst(hcaf_r,
+                     from = mean_risk_df$loiczid,
+                     to = mean_risk_df$mean_risk)
+mean_risk_r[mean_risk_r > 5] <- NA
+plot(mean_risk_r, main = "Mean extinction risk")
+
+
+```
